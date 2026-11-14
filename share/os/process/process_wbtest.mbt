@@ -382,10 +382,10 @@ async test "cancelling a run stops the command and its group" {
     defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
     let pidfile = "\{dir}/pid"
 
-    let finished = @async.with_timeout_opt(300, () => {
+    let finished = cancelled_after_ready(dir, () => {
       describe_run(
         "/bin/sh",
-        [mock("child.sh"), "term-ok", pidfile],
+        [mock("child.sh"), "term-ok", pidfile, "\{dir}/ready"],
         timeout_ms=30000,
       )
     })
@@ -488,13 +488,17 @@ async test "run_command ends a command that reads stdin to its end instead of wa
 ///|
 async test "run_command kills a command that ignores SIGTERM after a grace" {
   @testkit.serial(() => {
-    let (result, elapsed) = describe_command_run(
-      "trap '' TERM; sleep 5",
-      timeout_ms=100,
-    )
+    let dir = @testkit.scratch("ignore-term")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    // The command floods the output only once it ignores SIGTERM, so the output limit starts the stop at that point and no deadline can come first.
+    let script = "trap '' TERM; : > \{dir}/ready; head -c 17000000 /dev/zero; sleep 5"
+
+    let (result, elapsed) = timed_after_ready(dir, () => {
+      run_command_failure("/bin/sh", ["-c", script], timeout_ms=30000)
+    })
 
     assert_eq(
-      result, "command=/bin/sh message=/bin/sh was stopped after 100 ms code=none",
+      result, "command=/bin/sh message=cannot run /bin/sh code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
     )
     @testkit.assert_between(elapsed, 1000, 2500)
   })
@@ -506,16 +510,18 @@ async test "run_command stops a grandchild that keeps the output open after the 
     let dir = @testkit.scratch("stop-grandchild")
     defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
     let pidfile = "\{dir}/pid"
-
-    let (result, elapsed) = describe_command_run(
-      "sleep 30 & echo $! > \{pidfile}; exit 0",
-      timeout_ms=300,
+    let script = grandchild_after_leader_exit_script(
+      dir, pidfile, "head -c 17000000 /dev/zero; exec sleep 30",
     )
+
+    let (result, elapsed) = timed_after_ready(dir, () => {
+      run_command_failure("/bin/sh", ["-c", script], timeout_ms=30000)
+    })
 
     assert_eq(
-      result, "command=/bin/sh message=/bin/sh was stopped after 300 ms code=none",
+      result, "command=/bin/sh message=cannot run /bin/sh code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
     )
-    @testkit.assert_between(elapsed, 250, 1500)
+    @testkit.assert_between(elapsed, 0, 1500)
     assert_gone(pidfile)
   })
 }
@@ -568,10 +574,10 @@ async test "cancelling run_command ends the command's group" {
     defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
     let pidfile = "\{dir}/pid"
 
-    let finished = @async.with_timeout_opt(300, () => {
+    let finished = cancelled_after_ready(dir, () => {
       run_command(
         "/bin/sh",
-        ["-c", "sleep 30 & echo $! > \{pidfile}; sleep 30"],
+        ["-c", "sleep 30 & echo $! > \{pidfile}; : > \{dir}/ready; sleep 30"],
         plain_env(),
         timeout_ms=30000,
       )
@@ -692,13 +698,12 @@ async test "B1 cancelling a run whose leader already exited still ends the group
     let dir = @testkit.scratch("b1")
     defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
     let pidfile = "\{dir}/pid"
+    let script = grandchild_after_leader_exit_script(
+      dir, pidfile, "exec sleep 30",
+    )
 
-    let finished = @async.with_timeout_opt(300, () => {
-      describe_run(
-        "/bin/sh",
-        ["-c", "sleep 30 & echo $! > \{pidfile}; exit 0"],
-        timeout_ms=30000,
-      )
+    let finished = cancelled_after_ready(dir, () => {
+      describe_run("/bin/sh", ["-c", script], timeout_ms=30000)
     })
 
     assert_eq(finished, None)
@@ -937,17 +942,31 @@ fn grandchild_outside_group_script(ready : String) -> String {
 }
 
 ///|
-/// The result of `work` and the milliseconds from the grandchild's `ready` file to its end.
+fn grandchild_after_leader_exit_script(
+  dir : String,
+  pidfile : String,
+  work : String,
+) -> String {
+  // The stop must find the leader gone, so `ready` and `work` wait until `kill -0` fails, which a leader that exited but was not collected yet does not cause.
+  "sh -c 'until ! kill -0 \"$1\" 2>/dev/null; do sleep 0.05; done; : > \"$2/ready\"; \{work}' sh $$ \{dir} & echo $! > \{pidfile}; exit 0"
+}
+
+///|
+async fn wait_until_ready(dir : String) -> Unit {
+  while !@fs.readdir(dir).contains("ready") {
+    @async.sleep(10)
+  }
+}
+
+///|
+/// The result of `work` and the milliseconds from the command's `ready` file to its end.
 async fn[T] timed_after_ready(dir : String, work : async () -> T) -> (T, Int32) {
   let ready_at = Ref(@async.now())
   let outcome : Ref[T?] = Ref(None)
 
   @async.with_task_group(group => {
     group.spawn_bg(no_wait=true, () => {
-      while !@fs.readdir(dir).contains("ready") {
-        @async.sleep(10)
-      }
-
+      wait_until_ready(dir)
       ready_at.val = @async.now()
     })
 
@@ -955,6 +974,23 @@ async fn[T] timed_after_ready(dir : String, work : async () -> T) -> (T, Int32) 
   })
 
   (outcome.val.unwrap(), (@async.now() - ready_at.val).to_int())
+}
+
+///|
+/// The result of `work`, or None when the command's `ready` file appeared first and `work` was cancelled.
+async fn[T] cancelled_after_ready(dir : String, work : async () -> T) -> T? {
+  let outcome : Ref[T?] = Ref(None)
+
+  @async.with_task_group(group => {
+    group.spawn_bg(no_wait=true, () => {
+      wait_until_ready(dir)
+      group.return_immediately()
+    })
+
+    outcome.val = Some(work())
+  })
+
+  outcome.val
 }
 
 ///|
