@@ -523,10 +523,13 @@ async test "run_command stops a grandchild that keeps the output open after the 
 ///|
 async test "run_command gives up on a grandchild that left the group and keeps the output open" {
   @testkit.serial(() => {
-    let (result, elapsed) = describe_command_run(
-      "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(4)' & exit 0",
-      timeout_ms=300,
-    )
+    let dir = @testkit.scratch("give-up-grandchild")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    let script = grandchild_outside_group_script("\{dir}/ready")
+
+    let (result, elapsed) = timed_after_ready(dir, () => {
+      run_command_failure("/bin/sh", ["-c", script], timeout_ms=30000)
+    })
 
     assert_eq(
       mask_pid(result),
@@ -539,11 +542,15 @@ async test "run_command gives up on a grandchild that left the group and keeps t
 ///|
 async test "run_command closes every descriptor when it gives up on a grandchild" {
   @testkit.serial(() => {
+    let dir = @testkit.scratch("give-up-grandchild-fds")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    let script = grandchild_outside_group_script("\{dir}/ready")
     let before = @testkit.open_fds()
 
-    let (result, _) = describe_command_run(
-      "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(4)' & exit 0",
-      timeout_ms=300,
+    let result = run_command_failure(
+      "/bin/sh",
+      ["-c", script],
+      timeout_ms=30000,
     )
 
     assert_eq(
@@ -634,31 +641,40 @@ async test "run_inherited reports a command that cannot start with ENOENT" {
 ///|
 async test "a command that cannot be stopped makes the run fail as started" {
   @testkit.serial(() => {
-    // The grandchild leaves the process group, so only the deadline can end the run, and it keeps the output pipes open.
-    let script = "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(3)' & exit 0"
+    let dir = @testkit.scratch("cannot-stop")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    // The grandchild leaves the process group, so only the output limit can end the run, and it keeps the output pipes open.
+    let script = grandchild_outside_group_script("\{dir}/ready")
 
-    let (result, elapsed) = @testkit.timed(() => {
-      describe_run("/bin/sh", ["-c", script], timeout_ms=300, kill_grace_ms=200)
+    let (result, elapsed) = timed_after_ready(dir, () => {
+      describe_run(
+        "/bin/sh",
+        ["-c", script],
+        timeout_ms=30000,
+        kill_grace_ms=200,
+      )
     })
 
     assert_eq(
       mask_pid(result),
       "failed started=true: /bin/sh did not finish: pid <pid> did not exit after SIGKILL",
     )
-    @testkit.assert_between(elapsed, 600, 1500)
+    @testkit.assert_between(elapsed, 400, 1500)
   })
 }
 
 ///|
 async test "a run that cannot stop a command leaves no descriptor open" {
   @testkit.serial(() => {
-    let script = "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(3)' & exit 0"
+    let dir = @testkit.scratch("cannot-stop-fds")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    let script = grandchild_outside_group_script("\{dir}/ready")
     let before = @testkit.open_fds()
 
     let result = describe_run(
       "/bin/sh",
       ["-c", script],
-      timeout_ms=300,
+      timeout_ms=30000,
       kill_grace_ms=200,
     )
 
@@ -908,6 +924,37 @@ async fn describe_command_run(
   @testkit.timed(() => {
     run_command_failure("/bin/sh", ["-c", script], timeout_ms~)
   })
+}
+
+///|
+fn grandchild_outside_group_script(ready : String) -> String {
+  // The grandchild outlives the longest run these tests allow, so it still holds the output when the run gives up.
+  let lifetime_s = 6
+
+  // The leader floods the output only once the grandchild has left the group, so the output limit starts the stop at that point and no deadline can come first.
+  // The leader also stops waiting when the grandchild dies, so a failed start ends the run instead of hanging it.
+  "perl -MPOSIX -e 'POSIX::setsid() or exit 1; open(F, \">\", $ARGV[0]) or exit 1; close(F); exec q(sleep), q(\{lifetime_s})' \"\{ready}\" & until [ -e \"\{ready}\" ] || ! kill -0 $! 2>/dev/null; do sleep 0.05; done; head -c 17000000 /dev/zero; exit 0"
+}
+
+///|
+/// The result of `work` and the milliseconds from the grandchild's `ready` file to its end.
+async fn[T] timed_after_ready(dir : String, work : async () -> T) -> (T, Int32) {
+  let ready_at = Ref(@async.now())
+  let outcome : Ref[T?] = Ref(None)
+
+  @async.with_task_group(group => {
+    group.spawn_bg(no_wait=true, () => {
+      while !@fs.readdir(dir).contains("ready") {
+        @async.sleep(10)
+      }
+
+      ready_at.val = @async.now()
+    })
+
+    outcome.val = Some(work())
+  })
+
+  (outcome.val.unwrap(), (@async.now() - ready_at.val).to_int())
 }
 
 ///|
