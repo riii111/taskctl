@@ -9,6 +9,7 @@ import {
 }
 
 import {
+  "moonbitlang/core/async/fs",
   "moonbitlang/core/env",
   "moonbitlang/core/string",
   "riii111/harnexus-crew/share/os/testkit",
