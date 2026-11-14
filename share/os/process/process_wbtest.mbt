@@ -523,10 +523,11 @@ async test "run_command stops a grandchild that keeps the output open after the 
 ///|
 async test "run_command gives up on a grandchild that left the group and keeps the output open" {
   @testkit.serial(() => {
-    let (result, elapsed) = describe_command_run(
-      "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(4)' & exit 0",
-      timeout_ms=300,
-    )
+    let dir = @testkit.scratch("give-up-grandchild")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    let script = grandchild_outside_group_script("\{dir}/ready")
+
+    let (result, elapsed) = describe_command_run(script, timeout_ms=300)
 
     assert_eq(
       mask_pid(result),
@@ -539,12 +540,12 @@ async test "run_command gives up on a grandchild that left the group and keeps t
 ///|
 async test "run_command closes every descriptor when it gives up on a grandchild" {
   @testkit.serial(() => {
+    let dir = @testkit.scratch("give-up-grandchild-fds")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    let script = grandchild_outside_group_script("\{dir}/ready")
     let before = @testkit.open_fds()
 
-    let (result, _) = describe_command_run(
-      "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(4)' & exit 0",
-      timeout_ms=300,
-    )
+    let (result, _) = describe_command_run(script, timeout_ms=300)
 
     assert_eq(
       mask_pid(result),
@@ -634,32 +635,41 @@ async test "run_inherited reports a command that cannot start with ENOENT" {
 ///|
 async test "a command that cannot be stopped makes the run fail as started" {
   @testkit.serial(() => {
+    let dir = @testkit.scratch("cannot-stop")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
     // The grandchild leaves the process group, so only the deadline can end the run, and it keeps the output pipes open.
-    let script = "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(3)' & exit 0"
+    let script = grandchild_outside_group_script("\{dir}/ready")
 
     let (result, elapsed) = @testkit.timed(() => {
-      describe_run("/bin/sh", ["-c", script], timeout_ms=300, kill_grace_ms=200)
+      describe_run(
+        "/bin/sh",
+        ["-c", script],
+        timeout_ms=300,
+        kill_grace_ms=1000,
+      )
     })
 
     assert_eq(
       mask_pid(result),
       "failed started=true: /bin/sh did not finish: pid <pid> did not exit after SIGKILL",
     )
-    @testkit.assert_between(elapsed, 600, 1500)
+    @testkit.assert_between(elapsed, 2000, 3500)
   })
 }
 
 ///|
 async test "a run that cannot stop a command leaves no descriptor open" {
   @testkit.serial(() => {
-    let script = "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(3)' & exit 0"
+    let dir = @testkit.scratch("cannot-stop-fds")
+    defer @async.protect_from_cancel(() => @testkit.remove_tree(dir))
+    let script = grandchild_outside_group_script("\{dir}/ready")
     let before = @testkit.open_fds()
 
     let result = describe_run(
       "/bin/sh",
       ["-c", script],
       timeout_ms=300,
-      kill_grace_ms=200,
+      kill_grace_ms=1000,
     )
 
     assert_eq(
@@ -908,6 +918,15 @@ async fn describe_command_run(
   @testkit.timed(() => {
     run_command_failure("/bin/sh", ["-c", script], timeout_ms~)
   })
+}
+
+///|
+fn grandchild_outside_group_script(ready : String) -> String {
+  // The grandchild outlives the longest run these tests allow, so it still holds the output when the run gives up.
+  let lifetime_s = 6
+
+  // The leader ignores SIGTERM and waits for the grandchild's `ready` file, so the grandchild leaves the group before either can be stopped, however late it starts.
+  "trap '' TERM; perl -MPOSIX -e 'POSIX::setsid() or exit 1; open(F, \">\", $ARGV[0]) or exit 1; close(F); exec q(sleep), q(\{lifetime_s})' \"\{ready}\" & until [ -e \"\{ready}\" ]; do sleep 0.05; done; exit 0"
 }
 
 ///|
